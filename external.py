@@ -21,7 +21,7 @@ import torch.nn.functional as func
 from torch.autograd import Variable
 from math import exp
 
-
+@torch.jit.script
 def build_rotation(q):
     norm = torch.sqrt(q[:, 0] * q[:, 0] + q[:, 1] * q[:, 1] + q[:, 2] * q[:, 2] + q[:, 3] * q[:, 3])
     q = q / norm[:, None]
@@ -109,13 +109,17 @@ def update_params_and_optimizer(new_params, params, optimizer):
         group = [x for x in optimizer.param_groups if x["name"] == k][0]
         stored_state = optimizer.state.get(group['params'][0], None)
 
-        stored_state["exp_avg"] = torch.zeros_like(v)
-        stored_state["exp_avg_sq"] = torch.zeros_like(v)
-        del optimizer.state[group['params'][0]]
+        if stored_state is not None:
+            stored_state["exp_avg"] = torch.zeros_like(v)
+            stored_state["exp_avg_sq"] = torch.zeros_like(v)
+            del optimizer.state[group['params'][0]]
 
-        group["params"][0] = torch.nn.Parameter(v.requires_grad_(True))
-        optimizer.state[group['params'][0]] = stored_state
-        params[k] = group["params"][0]
+            group["params"][0] = torch.nn.Parameter(v.requires_grad_(True))
+            optimizer.state[group['params'][0]] = stored_state
+            params[k] = group["params"][0]
+        else:
+            group["params"][0] = torch.nn.Parameter(v.requires_grad_(True))
+            params[k] = group["params"][0]
     return params
 
 

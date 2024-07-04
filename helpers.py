@@ -31,30 +31,30 @@ def setup_camera(w, h, k, w2c, near=0.01, far=100):
     return cam
 
 
-def params2rendervar(params):
+def params2rendervar(params, retain2D=False):
     rendervar = {
         'means3D': params['means3D'],
         'colors_precomp': params['rgb_colors'],
         'rotations': torch.nn.functional.normalize(params['unnorm_rotations']),
         'opacities': torch.sigmoid(params['logit_opacities']),
         'scales': torch.exp(params['log_scales']),
-        'means2D': torch.zeros_like(params['means3D'], requires_grad=True, device="cuda") + 0
+        'means2D': torch.zeros_like(params['means3D'], requires_grad=retain2D, device="cuda") + 0
     }
     return rendervar
 
-
+@torch.jit.script
 def l1_loss_v1(x, y):
     return torch.abs((x - y)).mean()
 
-
+@torch.jit.script
 def l1_loss_v2(x, y):
     return (torch.abs(x - y).sum(-1)).mean()
 
-
+@torch.jit.script
 def weighted_l2_loss_v1(x, y, w):
     return torch.sqrt(((x - y) ** 2) * w + 1e-20).mean()
 
-
+@torch.jit.script
 def weighted_l2_loss_v2(x, y, w):
     return torch.sqrt(((x - y) ** 2).sum(-1) * w + 1e-20).mean()
 
