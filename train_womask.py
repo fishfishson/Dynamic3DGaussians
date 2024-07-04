@@ -182,6 +182,67 @@ def initialize_params(ply_path, scene_radius):
     return params, variables
 
 
+def initialize_gaussian(ply_path, sh_deg=0, scene_radius=1.0):
+    from plyfile import PlyData, PlyElement
+    plydata = PlyData.read(ply_path)
+    xyz = np.stack((np.asarray(plydata.elements[0]["x"]),
+                    np.asarray(plydata.elements[0]["y"]),
+                    np.asarray(plydata.elements[0]["z"])),  axis=1)
+    xyz = torch.from_numpy(xyz).float()
+
+    opacities = np.asarray(plydata.elements[0]["opacity"])[..., np.newaxis]
+    opacities = torch.from_numpy(opacities).float()
+
+    features_dc = np.zeros((xyz.shape[0], 3, 1))
+    features_dc[:, 0, 0] = np.asarray(plydata.elements[0]["f_dc_0"])
+    features_dc[:, 1, 0] = np.asarray(plydata.elements[0]["f_dc_1"])
+    features_dc[:, 2, 0] = np.asarray(plydata.elements[0]["f_dc_2"])
+    features_dc = torch.from_numpy(features_dc).float()
+
+    extra_f_names = [p.name for p in plydata.elements[0].properties if p.name.startswith("f_rest_")]
+    extra_f_names = sorted(extra_f_names, key = lambda x: int(x.split('_')[-1]))
+    features_extra = np.zeros((xyz.shape[0], len(extra_f_names)))
+    for idx, attr_name in enumerate(extra_f_names):
+        features_extra[:, idx] = np.asarray(plydata.elements[0][attr_name])
+    # Reshape (P,F*SH_coeffs) to (P, F, SH_coeffs except DC)
+    features_extra = features_extra.reshape((features_extra.shape[0], 3, (sh_deg + 1) ** 2 - 1))
+    features_rest = torch.from_numpy(features_extra).float()
+
+    scale_names = [p.name for p in plydata.elements[0].properties if p.name.startswith("scale_")]
+    scale_names = sorted(scale_names, key = lambda x: int(x.split('_')[-1]))
+    scales = np.zeros((xyz.shape[0], len(scale_names)))
+    for idx, attr_name in enumerate(scale_names):
+        scales[:, idx] = np.asarray(plydata.elements[0][attr_name])
+    scales = torch.from_numpy(scales).float()
+
+    rot_names = [p.name for p in plydata.elements[0].properties if p.name.startswith("rot")]
+    rot_names = sorted(rot_names, key = lambda x: int(x.split('_')[-1]))
+    rots = np.zeros((xyz.shape[0], len(rot_names)))
+    for idx, attr_name in enumerate(rot_names):
+        rots[:, idx] = np.asarray(plydata.elements[0][attr_name])
+    rots = torch.from_numpy(rots).float()
+
+    params = {
+        'means3D': xyz,
+        'rgb_colors': SH2RGB(features_dc)[..., 0],
+        # 'seg_colors': np.stack((seg, np.zeros_like(seg), 1 - seg), -1),
+        'unnorm_rotations': rots,
+        'logit_opacities': opacities,
+        'log_scales': scales,
+        # 'cam_m': np.zeros((max_cams, 3)),
+        # 'cam_c': np.zeros((max_cams, 3)),
+    }
+    params = {k: torch.nn.Parameter(torch.tensor(v).cuda().float().contiguous().requires_grad_(True)) for k, v in
+              params.items()}
+    # cam_centers = np.linalg.inv(md['w2c'][0])[:, :3, 3]  # Get scene radius
+    # scene_radius = 1.1 * np.max(np.linalg.norm(cam_centers - np.mean(cam_centers, 0)[None], axis=-1))
+    variables = {'max_2D_radius': torch.zeros(params['means3D'].shape[0]).cuda().float(),
+                 'scene_radius': scene_radius,
+                 'means2D_gradient_accum': torch.zeros(params['means3D'].shape[0]).cuda().float(),
+                 'denom': torch.zeros(params['means3D'].shape[0]).cuda().float()}
+    return params, variables
+
+
 def write_params(path, params):
     from plyfile import PlyData, PlyElement
     _xyz = params['means3D']
@@ -367,8 +428,12 @@ def train(args):
     train_cameras = dotdict()
     for k in train_camera_names:
         train_cameras[k] = cameras[k]
-
-    params, variables = initialize_params(os.path.join(args.data_root, args.init_ply), scene_radius)
+    
+    if args.init_gs is not None:
+        params, variables = initialize_gaussian(args.init_gs, sh_deg=0, scene_radius=scene_radius)
+    elif args.init_ply is not None:
+        params, variables = initialize_params(os.path.join(args.data_root, args.init_ply), scene_radius)
+    else: raise ValueError("Please provide either init_ply or init_gs")
     device = params['means3D'].device
     optimizer = initialize_optimizer(params, variables)
     # output_params = []
@@ -383,7 +448,7 @@ def train(args):
         is_initial_timestep = (f == args.frame_start)
         if not is_initial_timestep:
             params, variables = initialize_per_timestep(params, variables, optimizer)
-        num_iter_per_timestep = 10000 if is_initial_timestep else 2000
+        num_iter_per_timestep = 10000 if (is_initial_timestep and f == 0) else 2000
         sampler = RandomSampler(dataset, replacement=True, num_samples=num_iter_per_timestep)
         batch_sampler = BatchSampler(sampler, batch_size=1, drop_last=False)
         dataloader = DataLoader(dataset, batch_sampler=batch_sampler, num_workers=2)
@@ -431,12 +496,12 @@ def train(args):
                     log(blue(f'training psnr of iter {batch_id}: {PSNR:.{4}f}'))
                     progress_bar.update(args.log_interval)
         progress_bar.close()
-        save_path = os.path.join(args.save_dir, f"{f:06d}.ply")
         # output_params.append(params2cpu(params, is_initial_timestep))
         if is_initial_timestep:
             variables = initialize_post_first_timestep(params, variables, optimizer)
         
         if f % args.test_interval == 0:
+            save_path = os.path.join(args.save_dir, f"{f:06d}.ply")
             write_params(save_path, params)
             dataset = get_dataset(args.data_root, f, test_cameras, scale=args.scale)
             sampler = SequentialSampler(dataset)
@@ -489,6 +554,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--data_root", type=str)
     parser.add_argument("--init_ply", type=str, default="dense_pcds/000000.ply")
+    parser.add_argument("--init_gs", type=str, default=None)
     parser.add_argument("--save_dir", type=str, default='./data/results')
     parser.add_argument("--frame_start", type=int, default=0)
     parser.add_argument("--frame_end", type=int, default=1200)

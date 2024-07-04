@@ -7,7 +7,7 @@ import cv2
 
 import torch
 import torch.nn as nn
-from torch.utils.data import Dataset 
+from torch.utils.data import RandomSampler, BatchSampler, SequentialSampler, DataLoader, Dataset
 import pytorch_lightning as pl
 
 from easyvolcap.utils.base_utils import *
@@ -233,6 +233,8 @@ class MvRgbDataset(Dataset):
     def getitem(self, index):
         ply_idx, view_idx = self.data_list[index]
 
+        camera_name = self.cam_names[view_idx]
+
         ply_data = {}
         for k in self.ply.keys():
             ply_data[k] = {}
@@ -244,7 +246,8 @@ class MvRgbDataset(Dataset):
 
         ply_name = self.ply_names[k][ply_idx]
         frame = ply_name.split('.')[0].split('-')[-1]
-        img = cv2.imread()
+        image = cv2.imread(os.path.join(self.render_dir, 'images', self.cam_names[view_idx], f'{frame}.jpg'))
+        mask = cv2.imread(os.path.join(self.render_dir, 'masks', self.cam_names[view_idx], f'{frame}.jpg'))
 
         return {
             'K': self.Ks[view_idx],
@@ -254,6 +257,8 @@ class MvRgbDataset(Dataset):
             'view_idx': view_idx,
             'ply_idx': ply_idx,
             'frame_idx': int(frame),
+            'image': image,
+            'mask': mask,
         }
 
 def main(args):
@@ -268,8 +273,10 @@ def main(args):
         render_dir=args.render_dir,
         ply_dir=args.ply_dir,
     )
-    data = dataset[0]
-    breakpoint()
+    sampler = RandomSampler(dataset, replacement=True, num_samples=args.iters)
+    batch_sampler = BatchSampler(sampler, batch_size=1, drop_last=False)
+    datalaoder = DataLoader(dataset, batch_sampler=batch_sampler, num_workers=4)
+    
 
 
 if __name__ == "__main__":
@@ -277,5 +284,6 @@ if __name__ == "__main__":
     parser.add_argument("--cam_dir", type=str)
     parser.add_argument("--render_dir", type=str)
     parser.add_argument("--ply_dir", type=str)
+    parser.add_argument("--iters", type=int, default=100000)
     args = parser.parse_args()
     main(args)
