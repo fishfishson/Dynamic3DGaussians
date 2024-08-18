@@ -65,7 +65,9 @@ class MiniDataset(Dataset):
                  cameras: dotdict,
                  camera_names: list,
                  near: float = 0.01,
-                 far: float = 10.0,
+                 far: float = 100.0,
+                 H: int = None,
+                 W: int = None,
                  ):
         super().__init__()
     
@@ -75,6 +77,8 @@ class MiniDataset(Dataset):
         self.camera_names = camera_names
         self.near = near
         self.far = far
+        self.H = H
+        self.W = W
 
     def __len__(self):
         return len(self.images)
@@ -534,7 +538,7 @@ def train(args):
                     )
                     rendervar = params2rendervar(params, retain2D=False)
                     im, dpt, acc, radius = GaussianRasterizer(raster_settings=raster_settings)(**rendervar)
-                    pred = im.permute(1, 2, 0)
+                    pred = im.permute(1, 2, 0).clip(0, 1)
                     gt = batch.image[i].permute(1, 2, 0)
                     PSNR = psnr(pred, gt)
                     SSIM = ssim(pred, gt)
