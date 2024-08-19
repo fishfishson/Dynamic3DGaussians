@@ -20,6 +20,9 @@ import torch
 import torch.nn.functional as func
 from torch.autograd import Variable
 from math import exp
+from easyvolcap.utils.base_utils import *
+from easyvolcap.utils.console_utils import *
+
 
 @torch.jit.script
 def build_rotation(q):
@@ -101,6 +104,8 @@ def accumulate_mean2d_gradient(variables):
     variables['means2D_gradient_accum'][variables['seen']] += torch.norm(
         variables['means2D'].grad[variables['seen'], :2], dim=-1)
     variables['denom'][variables['seen']] += 1
+    # variables['max_2D_radius'][variables['seen']] = torch.maximum(variables['max_2D_radius'][variables['seen']],
+    #     variables['radius'][variables['seen']])
     return variables
 
 
@@ -173,11 +178,16 @@ def densify(params, variables, optimizer, i):
         if (i >= 500) and (i % 100 == 0):
             grads = variables['means2D_gradient_accum'] / variables['denom']
             grads[grads.isnan()] = 0.0
+            # to_remove = variables['max_2D_radius'] > 50
+            # log(blue(f'[REMOVE] num big radius {to_remove.sum()}'))
+            # params, variables = remove_points(to_remove, params, variables, optimizer)
+            # grads = grads[~to_remove]
             to_clone = torch.logical_and(grads >= grad_thresh, (
                         torch.max(torch.exp(params['log_scales']), dim=1).values <= 0.01 * variables['scene_radius']))
             new_params = {k: v[to_clone] for k, v in params.items() if k not in ['cam_m', 'cam_c']}
             params = cat_params_to_optimizer(new_params, params, optimizer)
             num_pts = params['means3D'].shape[0]
+            log(blue(f'[CLONE] current num of points {num_pts}'))
 
             padded_grad = torch.zeros(num_pts, device="cuda")
             padded_grad[:grads.shape[0]] = grads
@@ -200,18 +210,24 @@ def densify(params, variables, optimizer, i):
             variables['max_2D_radius'] = torch.zeros(num_pts, device="cuda")
             to_remove = torch.cat((to_split, torch.zeros(n * to_split.sum(), dtype=torch.bool, device="cuda")))
             params, variables = remove_points(to_remove, params, variables, optimizer)
-
+            num_pts = params['means3D'].shape[0]
+            log(blue(f'[SPLIT] current num of points {num_pts}'))
+            
             remove_threshold = 0.25 if i == 5000 else 0.005
             to_remove = (torch.sigmoid(params['logit_opacities']) < remove_threshold).squeeze()
+            log(blue(f'[REMOVE] num low occ {to_remove.sum()}'))
             if i >= 3000:
                 big_points_ws = torch.exp(params['log_scales']).max(dim=1).values > 0.1 * variables['scene_radius']
                 to_remove = torch.logical_or(to_remove, big_points_ws)
+                log(blue(f'[REMOVE] num big ws {big_points_ws.sum()}'))
             params, variables = remove_points(to_remove, params, variables, optimizer)
-
+            num_pts = params['means3D'].shape[0]
+            log(blue(f'[REMOVE] current num of points {num_pts}'))
             torch.cuda.empty_cache()
 
         if i > 0 and i % 3000 == 0:
             new_params = {'logit_opacities': inverse_sigmoid(torch.ones_like(params['logit_opacities']) * 0.01)}
             params = update_params_and_optimizer(new_params, params, optimizer)
+            log(blue(f'[RESET]'))
 
     return params, variables

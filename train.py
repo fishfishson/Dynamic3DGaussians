@@ -11,6 +11,45 @@ from helpers import setup_camera, l1_loss_v1, l1_loss_v2, weighted_l2_loss_v1, w
     o3d_knn, params2rendervar, params2cpu, save_params
 from external import calc_ssim, calc_psnr, build_rotation, densify, update_params_and_optimizer
 
+from easyvolcap.utils.base_utils import *
+from easyvolcap.utils.console_utils import *
+from easyvolcap.utils.data_utils import to_tensor, to_cuda
+from easyvolcap.utils.sh_utils import SH2RGB, RGB2SH
+from easyvolcap.utils.gaussian_utils import convert_to_gaussian_camera
+from easyvolcap.utils.loss_utils import mIoU_loss
+from easyvolcap.utils.loss_utils import mse as compute_mse
+from easyvolcap.utils.loss_utils import lpips as compute_lpips
+from skimage.metrics import structural_similarity as compare_ssim
+
+
+@torch.no_grad()
+def psnr(x: torch.Tensor, y: torch.Tensor):
+    mse = compute_mse(x, y).mean()
+    psnr = (1 / mse.clip(1e-10)).log() * 10 / np.log(10)
+    return psnr.item()  # tensor to scalar
+
+
+@torch.no_grad()
+def ssim(x: torch.Tensor, y: torch.Tensor):
+    return np.mean([
+        compare_ssim(
+            _x.detach().cpu().numpy(),
+            _y.detach().cpu().numpy(),
+            channel_axis=-1,
+            data_range=2.0
+        )
+        for _x, _y in zip(x, y)
+    ]).astype(float).item()
+
+
+@torch.no_grad()
+def lpips(x: torch.Tensor, y: torch.Tensor):
+    if x.ndim == 3: x = x.unsqueeze(0)
+    if y.ndim == 3: y = y.unsqueeze(0)
+    x = x.permute(0, 3, 1, 2)
+    y = y.permute(0, 3, 1, 2)
+    return compute_lpips(x, y, net='vgg').item()
+
 
 def get_dataset(t, md, seq):
     dataset = []
@@ -188,7 +227,7 @@ def train(seq, exp):
     if os.path.exists(f"./output/{exp}/{seq}"):
         print(f"Experiment '{exp}' for sequence '{seq}' already exists. Exiting.")
         return
-    md = json.load(open(f"./data/{seq}/train_meta.json", 'r'))  # metadata
+    # md = json.load(open(f"./data/{seq}/train_meta.json", 'r'))  # metadata 
     num_timesteps = len(md['fn'])
     params, variables = initialize_params(seq, md)
     optimizer = initialize_optimizer(params, variables)
@@ -220,6 +259,6 @@ def train(seq, exp):
 
 if __name__ == "__main__":
     exp_name = "exp1"
-    for sequence in ["basketball", "boxes", "football", "juggle", "softball", "tennis"]:
+    for sequence in ["basketball", "boxes", "softball"]:
         train(sequence, exp_name)
         torch.cuda.empty_cache()

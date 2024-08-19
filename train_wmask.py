@@ -26,7 +26,6 @@ from easyvolcap.utils.gaussian_utils import convert_to_gaussian_camera
 from easyvolcap.utils.loss_utils import mIoU_loss
 from easyvolcap.utils.loss_utils import mse as compute_mse
 from easyvolcap.utils.loss_utils import lpips as compute_lpips
-from easyvolcap.utils.undist_utils import colmap_undistort_numpy
 from skimage.metrics import structural_similarity as compare_ssim
 
 
@@ -66,7 +65,7 @@ class MiniDataset(Dataset):
                  cameras: dotdict,
                  camera_names: list,
                  near: float = 1.0,
-                 far: float = 50.0,
+                 far: float = 10.0,
                  H: int = None,
                  W: int = None,
                  ):
@@ -88,8 +87,10 @@ class MiniDataset(Dataset):
         image = torch.from_numpy(self.images[index]).float().permute(2, 0, 1)
         if self.masks is not None:
             mask = torch.from_numpy(self.masks[index]).float()[None]
+            mask = torch.cat([mask, torch.zeros_like(mask), 1 - mask], dim=0)
         else:
             mask = torch.ones_like(image[:1])
+            mask = torch.cat([mask, torch.zeros_like(mask), 1 - mask], dim=0)
 
         meta = dotdict()
         meta.H = image.shape[1]
@@ -123,42 +124,35 @@ def get_dataset(data_root: str, frame: int, cameras: dict, images_dir: str = 'im
             'K': v['K'].copy(),
             'R': v['R'].copy(),
             'T': v['T'].copy(),
-            'D': v['D'].copy(),
             'ccm': v['ccm'].copy(),
         }
     cameras = _cameras
 
     images = []
-    # masks = []
+    masks = []
     camera_names = []
-    for k in tqdm(natsorted(cameras.keys()), desc='loading and undist images'):
-        img_path = os.path.join(data_root, images_dir, k, f'{frame:06d}.jpg')
-        img = cv2.imread(img_path, cv2.IMREAD_UNCHANGED)
-        # masks.append(os.path.join(data_root, masks_dir, k, f'{frame:04d}.jpg'))
-        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        img, new_K = colmap_undistort_numpy(img, cameras[k]['K'], cameras[k]['D'])
-        cameras[k]['K'] = new_K
-        images.append(img / 255.0)
+    for k in natsorted(cameras.keys()):
+        images.append(os.path.join(data_root, images_dir, k, f'{frame:06d}.jpg'))
+        masks.append(os.path.join(data_root, masks_dir, k, f'{frame:06d}.jpg'))
         camera_names.append(k)
-
-    # images = [cv2.imread(x, cv2.IMREAD_UNCHANGED) for x in tqdm(images, desc='Loading images')]
-    # images = [cv2.cvtColor(x, cv2.COLOR_BGR2RGB) for x in images]
-    # masks = [cv2.imread(x, cv2.IMREAD_UNCHANGED) for x in tqdm(masks, desc='Loading masks')]
+    
+    images = [cv2.imread(x, cv2.IMREAD_UNCHANGED) for x in tqdm(images, desc='Loading images')]
+    images = [cv2.cvtColor(x, cv2.COLOR_BGR2RGB) for x in images]
+    masks = [cv2.imread(x, cv2.IMREAD_UNCHANGED) for x in tqdm(masks, desc='Loading masks')]
     if scale != 1.0:
-        raise NotImplementedError
         image_height = int(images[0].shape[0] * scale)
         image_width = int(images[0].shape[1] * scale)
         h_scale = image_height / images[0].shape[0]
         w_scale = image_width / images[0].shape[1]
         images = [cv2.resize(x, (image_width, image_height), interpolation=cv2.INTER_AREA) for x in tqdm(images, desc='resizing images')]
-        # masks = [cv2.resize(x, (image_width, image_height), interpolation=cv2.INTER_AREA) for x in tqdm(masks, desc='resizing masks')]
+        masks = [cv2.resize(x, (image_width, image_height), interpolation=cv2.INTER_AREA) for x in tqdm(masks, desc='resizing masks')]
         for v in cameras.values():
             v['K'][0] *= w_scale
             v['K'][1] *= h_scale       
 
-    # images = np.stack(images, axis=0) / 255.0
-    # masks = np.stack(masks, axis=0) / 255.0
-    dataset = MiniDataset(images, None, cameras, camera_names) 
+    images = np.stack(images, axis=0) / 255.0
+    masks = np.stack(masks, axis=0) / 255.0
+    dataset = MiniDataset(images, masks, cameras, camera_names) 
     return dataset
 
 
@@ -176,7 +170,6 @@ def initialize_params(args, scene_radius):
     from easyvolcap.utils.data_utils import load_pts
     fg_ply_path = os.path.join(args.data_root, args.init_ply)
     bg_ply_path = os.path.join(args.data_root, 'kinect/000000.ply')
-    # bg_ply_path = os.path.join(args.data_root, 'dense_pcds_rc_180k/000000.ply')
     
     fg_pcd, fg_rgb, _, _ = load_pts(fg_ply_path)
     log(f'num of fg points: {fg_pcd.shape[0]}')
@@ -185,6 +178,9 @@ def initialize_params(args, scene_radius):
     
     pcd = np.concatenate((fg_pcd, bg_pcd), axis=0)
     rgb = np.concatenate((fg_rgb, bg_rgb), axis=0)
+    fg_seg = np.ones(fg_pcd.shape[0])
+    bg_seg = np.zeros(bg_pcd.shape[0])
+    seg = np.concatenate((fg_seg, bg_seg), axis=0)
     
     max_cams = 50
     sq_dist, _ = o3d_knn(pcd, 3)
@@ -192,14 +188,14 @@ def initialize_params(args, scene_radius):
     params = {
         'means3D': pcd,
         'rgb_colors': rgb,
-        # 'seg_colors': np.stack((seg, np.zeros_like(seg), 1 - seg), -1),
-        'unnorm_rotations': np.tile([1, 0, 0, 0], (pcd.shape[0], 1)),
-        'logit_opacities': np.zeros((pcd.shape[0], 1)),
+        'seg_colors': np.stack((seg, np.zeros_like(seg), 1 - seg), -1),
+        'unnorm_rotations': np.tile([1, 0, 0, 0], (seg.shape[0], 1)),
+        'logit_opacities': np.zeros((seg.shape[0], 1)),
         'log_scales': np.tile(np.log(np.sqrt(mean3_sq_dist))[..., None], (1, 3)),
         # 'cam_m': np.zeros((max_cams, 3)),
         # 'cam_c': np.zeros((max_cams, 3)),
     }
-    params = {k: torch.nn.Parameter(torch.tensor(v).cuda().float().contiguous().requires_grad_(True)) for k, v in
+    params = {k: torch.nn.Parameter(torch.tensor(v).cuda().float(), requires_grad=True) for k, v in
               params.items()}
     if scene_radius is None:
         cam_centers = np.linalg.inv(md['w2c'][0])[:, :3, 3]  # Get scene radius
@@ -259,8 +255,8 @@ def initialize_gaussian(ply_path, sh_deg=0, scene_radius=1.0):
         'unnorm_rotations': rots,
         'logit_opacities': opacities,
         'log_scales': scales,
-        # 'cam_m': np.zeros((max_cams, 3)),
-        # 'cam_c': np.zeros((max_cams, 3)),
+        'cam_m': np.zeros((max_cams, 3)),
+        'cam_c': np.zeros((max_cams, 3)),
     }
     params = {k: torch.nn.Parameter(torch.tensor(v).cuda().float().contiguous().requires_grad_(True)) for k, v in
               params.items()}
@@ -317,12 +313,12 @@ def initialize_optimizer(params, variables):
     lrs = {
         'means3D': 0.00016 * variables['scene_radius'],
         'rgb_colors': 0.0025,
-        # 'seg_colors': 0.0,
+        'seg_colors': 0.0,
         'unnorm_rotations': 0.001,
         'logit_opacities': 0.05,
         'log_scales': 0.001,
-        # 'cam_m': 1e-4,
-        # 'cam_c': 1e-4,
+        'cam_m': 1e-4,
+        'cam_c': 1e-4,
     }
     param_groups = [{'params': [v], 'name': k, 'lr': lrs[k]} for k, v in params.items()]
     return torch.optim.Adam(param_groups, lr=0.0, eps=1e-15)
@@ -335,25 +331,27 @@ def get_loss(params, curr_data, variables, raster_settings, is_initial_timestep)
     if rendervar['means2D'].requires_grad:
         rendervar['means2D'].retain_grad()
     im, dpt, acc, radius = GaussianRasterizer(raster_settings=raster_settings)(**rendervar)
+    out = dotdict(img=im, dpt=dpt, acc=acc, radius=radius)
     
-    # curr_id = curr_data['id']
+    # curr_id = curr_data['camera_id']
     # im = torch.exp(params['cam_m'][curr_id])[:, None, None] * im + params['cam_c'][curr_id][:, None, None]
     im = im.permute(1, 2, 0) @ curr_data['ccm'][:3, :3] + curr_data['ccm'][:, 3]
     im = im.permute(2, 0, 1).clip(0, 1)
-    out = dotdict(img=im, dpt=dpt, acc=acc, radius=radius)
     
     losses['im'] = 0.8 * l1_loss_v1(im, curr_data['im']) + 0.2 * (1.0 - calc_ssim(im, curr_data['im']))
     variables['means2D'] = rendervar['means2D']  # Gradient only accum from colour render for densification
-
-    # segrendervar = params2rendervar(params)
-    # segrendervar['colors_precomp'] = params['seg_colors']
-    # seg, _, _, = Renderer(raster_settings=curr_data['cam'])(**segrendervar)
-    # losses['seg'] = 0.8 * l1_loss_v1(seg, curr_data['seg']) + 0.2 * (1.0 - calc_ssim(seg, curr_data['seg']))
+    # variables['radius'] = radius
+    
+    segrendervar = params2rendervar(params, retain2D=False)
+    segrendervar['colors_precomp'] = params['seg_colors']
+    seg, _, _, _ = GaussianRasterizer(raster_settings=raster_settings)(**segrendervar)
+    out.seg = seg
+    losses['seg'] = 0.8 * l1_loss_v1(seg, curr_data['seg']) + 0.2 * (1.0 - calc_ssim(seg, curr_data['seg']))
 
     if not is_initial_timestep:
-        # is_fg = (params['seg_colors'][:, 0] > 0.5).detach()
-        fg_pts = rendervar['means3D']
-        fg_rot = rendervar['rotations']
+        is_fg = (params['seg_colors'][:, 0] > 0.5).detach()
+        fg_pts = rendervar['means3D'][is_fg]
+        fg_rot = rendervar['rotations'][is_fg]
 
         rel_rot = quat_mult(fg_rot, variables["prev_inv_rot_fg"])
         rot = build_rotation(rel_rot)
@@ -369,11 +367,11 @@ def get_loss(params, curr_data, variables, raster_settings, is_initial_timestep)
         curr_offset_mag = torch.sqrt((curr_offset ** 2).sum(-1) + 1e-20)
         losses['iso'] = weighted_l2_loss_v1(curr_offset_mag, variables["neighbor_dist"], variables["neighbor_weight"])
 
-        # losses['floor'] = torch.clamp(fg_pts[:, 1], min=0).mean()
+        losses['floor'] = torch.clamp(fg_pts[:, 1], min=0).mean()
 
-        # bg_pts = rendervar['means3D'][~is_fg]
-        # bg_rot = rendervar['rotations'][~is_fg]
-        # losses['bg'] = l1_loss_v2(bg_pts, variables["init_bg_pts"]) + l1_loss_v2(bg_rot, variables["init_bg_rot"])
+        bg_pts = rendervar['means3D'][~is_fg]
+        bg_rot = rendervar['rotations'][~is_fg]
+        losses['bg'] = l1_loss_v2(bg_pts, variables["init_bg_pts"]) + l1_loss_v2(bg_rot, variables["init_bg_rot"])
 
         losses['soft_col_cons'] = l1_loss_v2(params['rgb_colors'], variables["prev_col"])
 
@@ -392,9 +390,10 @@ def initialize_per_timestep(params, variables, optimizer):
     new_pts = pts + (pts - variables["prev_pts"])
     new_rot = torch.nn.functional.normalize(rot + (rot - variables["prev_rot"]))
 
-    prev_inv_rot_fg = rot
+    is_fg = params['seg_colors'][:, 0] > 0.5
+    prev_inv_rot_fg = rot[is_fg]
     prev_inv_rot_fg[:, 1:] = -1 * prev_inv_rot_fg[:, 1:]
-    fg_pts = pts
+    fg_pts = pts[is_fg]
     prev_offset = fg_pts[variables["neighbor_indices"]] - fg_pts[:, None]
     variables['prev_inv_rot_fg'] = prev_inv_rot_fg.detach()
     variables['prev_offset'] = prev_offset.detach()
@@ -409,10 +408,10 @@ def initialize_per_timestep(params, variables, optimizer):
 
 
 def initialize_post_first_timestep(params, variables, optimizer, num_knn=20):
-    # is_fg = params['seg_colors'][:, 0] > 0.5
-    init_fg_pts = params['means3D']
-    # init_bg_pts = params['means3D']
-    # init_bg_rot = torch.nn.functional.normalize(params['unnorm_rotations'])
+    is_fg = params['seg_colors'][:, 0] > 0.5
+    init_fg_pts = params['means3D'][is_fg]
+    init_bg_pts = params['means3D'][~is_fg]
+    init_bg_rot = torch.nn.functional.normalize(params['unnorm_rotations'][~is_fg])
     neighbor_sq_dist, neighbor_indices = o3d_knn(init_fg_pts.detach().cpu().numpy(), num_knn)
     neighbor_weight = np.exp(-2000 * neighbor_sq_dist)
     neighbor_dist = np.sqrt(neighbor_sq_dist)
@@ -420,8 +419,8 @@ def initialize_post_first_timestep(params, variables, optimizer, num_knn=20):
     variables["neighbor_weight"] = torch.tensor(neighbor_weight).cuda().float().contiguous()
     variables["neighbor_dist"] = torch.tensor(neighbor_dist).cuda().float().contiguous()
 
-    # variables["init_bg_pts"] = init_bg_pts.detach()
-    # variables["init_bg_rot"] = init_bg_rot.detach()
+    variables["init_bg_pts"] = init_bg_pts.detach()
+    variables["init_bg_rot"] = init_bg_rot.detach()
     variables["prev_pts"] = params['means3D'].detach()
     variables["prev_rot"] = torch.nn.functional.normalize(params['unnorm_rotations']).detach()
     params_to_fix = ['logit_opacities', 'log_scales', 'cam_m', 'cam_c']
@@ -479,6 +478,7 @@ def train(args):
         raise NotImplementedError
         params, variables = initialize_gaussian(args.init_gs, sh_deg=0, scene_radius=scene_radius)
     elif args.init_ply is not None:
+        # special design for cmu
         params, variables = initialize_params(args, scene_radius)
     else: raise ValueError("Please provide either init_ply or init_gs")
     device = params['means3D'].device
@@ -491,6 +491,7 @@ def train(args):
 
     frames = range(args.frame_start, args.frame_end)
     for f in frames:
+        log(f"processing frame {f}")
         dataset = get_dataset(args.data_root, f, train_cameras, scale=args.scale)
         is_initial_timestep = (f == args.frame_start)
         if not is_initial_timestep:
@@ -527,6 +528,7 @@ def train(args):
                 )
                 curr_data = {
                     'im': batch.image[i],
+                    'seg': batch.mask[i],
                     'camera_id': batch.camera_id[i],
                     'ccm': batch.ccm[i],
                 }
@@ -542,17 +544,21 @@ def train(args):
                     gt = curr_data['im']
                     PSNR = psnr(out['img'], gt)
                     log(blue(f'training psnr of iter {batch_id}: {PSNR:.{4}f}'))
-                    if (batch_id + 1) % args.log_interval * 5 == 0:
-                        os.makedirs(os.path.join(args.save_dir, 'training', f'{f:06d}'), exist_ok=True)
-                        save_path = os.path.join(args.save_dir, 'training', f'{f:06d}', f'iter_{batch_id:06d}_camera_{camera_name[-1]}.jpg')
-                        save_image(torch.cat([out['img'], gt], dim=-2), save_path)
+                    os.makedirs(os.path.join(args.save_dir, 'images', f'{f:06d}'), exist_ok=True)
+                    save_path = os.path.join(args.save_dir, 'images', f'{f:06d}', f'iter_{batch_id:06d}_camera_{camera_name[-1]}.jpg')
+                    save_image(torch.cat([out['img'], gt], dim=-2), save_path)
+                    gt = curr_data['seg']
+                    os.makedirs(os.path.join(args.save_dir, 'masks', f'{f:06d}'), exist_ok=True)
+                    save_path = os.path.join(args.save_dir, 'masks', f'{f:06d}', f'iter_{batch_id:06d}_camera_{camera_name[-1]}.jpg')
+                    save_image(torch.cat([out['seg'], gt], dim=-2), save_path)
                     progress_bar.update(args.log_interval)
+            
         progress_bar.close()
         # output_params.append(params2cpu(params, is_initial_timestep))
         if is_initial_timestep:
             variables = initialize_post_first_timestep(params, variables, optimizer)
         
-        if f % args.test_interval == 0:
+        if f % args.test_interval == 0 and f > 0:
             save_path = os.path.join(args.save_dir, f"{f:06d}.ply")
             write_params(save_path, params)
             dataset = get_dataset(args.data_root, f, test_cameras, scale=args.scale)
@@ -586,23 +592,20 @@ def train(args):
                     )
                     rendervar = params2rendervar(params, retain2D=False)
                     im, dpt, acc, radius = GaussianRasterizer(raster_settings=raster_settings)(**rendervar)
-                    pred = (im.permute(1, 2, 0) @ batch.ccm[i][:3, :3] + batch.ccm[i][:, 3]).clip(0, 1)
+                    pred = im.permute(1, 2, 0).clip(0, 1)
                     gt = batch.image[i].permute(1, 2, 0)
-                    if f in args.record_interval:
-                        PSNR = psnr(pred, gt)
-                        SSIM = ssim(pred, gt)
-                        LPIPS = lpips(pred, gt)
-                        METRIC[f'cam_{camera_name[i]}_frame_{f:06d}'] = dotdict(PSNR=PSNR, SSIM=SSIM, LPIPS=LPIPS)
-                        PSNRS.append(PSNR)
-                        SSIMS.append(SSIM)
-                        LPIPSS.append(LPIPS)
-                    os.makedirs(os.path.join(args.save_dir, 'images', f'{f:06d}'), exist_ok=True)
-                    save_path = os.path.join(args.save_dir, 'images', f'{f:06d}', f'camera_{camera_name[i]}.jpg')
-                    save_image(torch.cat([pred, gt], dim=-2).permute(2, 0, 1), save_path)
-            METRIC['summary'] = dotdict(PSNR=np.mean(PSNRS), SSIM=np.mean(SSIMS), LPIPS=np.mean(LPIPSS))
+                    PSNR = psnr(pred, gt)
+                    SSIM = ssim(pred, gt)
+                    LPIPS = lpips(pred, gt)
+                    METRIC[f'cam_{camera_name[i]}_frame_{f:06d}'] = dotdict(PSNR=PSNR, SSIM=SSIM, LPIPS=LPIPS)
+                    PSNRS.append(PSNR)
+                    SSIMS.append(SSIM)
+                    LPIPSS.append(LPIPS)
             with open(os.path.join(args.save_dir, 'metric.json'), 'w') as f:
                 json.dump(METRIC, f, indent=4)
         
+    print(f"PSNR: {np.mean(PSNRS):}, SSIM: {np.mean(SSIMS)}, LPIPS: {np.mean(LPIPSS)}")
+
 
 if __name__ == "__main__":
     import argparse
@@ -617,7 +620,6 @@ if __name__ == "__main__":
     parser.add_argument("--exp_name", type=str, default=None)
     parser.add_argument("--log_interval", type=int, default=200)
     parser.add_argument("--test_interval", type=int, default=100)
-    parser.add_argument("--record_interval", nargs=3, type=int, default=[100, 701, 100])
     args = parser.parse_args()
 
     if args.exp_name == None:
@@ -628,7 +630,5 @@ if __name__ == "__main__":
         args.save_dir = os.path.join(args.save_dir, args.exp_name)
     os.makedirs(args.save_dir, exist_ok=True)
 
-    args.record_interval = range(*args.record_interval)
-    log(yellow(f'test frames: {args.record_interval}'))
     train(args)
     torch.cuda.empty_cache()
