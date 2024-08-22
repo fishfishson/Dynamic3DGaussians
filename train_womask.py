@@ -463,7 +463,7 @@ def train(args):
     scene_radius = 1.1 * np.max(np.linalg.norm(camera_centers - np.mean(camera_centers, 0)[None], axis=-1))
     log(blue(f'scene_radius: {scene_radius}'))
     
-    test_camera_names = ['0000', '0010', '0020', '0030']
+    test_camera_names = ['0000', '0010', '0015', '0030']
     test_cameras = dotdict()
     for k in test_camera_names:
         test_cameras[k] = cameras[k]
